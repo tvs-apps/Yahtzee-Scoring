@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Yahtzee Scorekeeper</title>
+<style>
+  body { font-family: Arial, sans-serif; background: #f9f9f9; margin: 0; padding: 20px; }
+  h1 { text-align: center; }
+  table { border-collapse: collapse; margin: 20px auto; min-width: 700px; }
+  th, td { border: 1px solid #ccc; padding: 6px; text-align: center; vertical-align: middle; }
+  th { background: #eee; }
+  input[type=number], select { width: 70px; text-align: right; }
+  .yahtzee-bonus-box { display: flex; flex-direction: column; align-items: center; }
+  .yahtzee-bonus-box input { width: 60px; text-align: center; margin-bottom: 4px; }
+  .yahtzee-bonus-label { font-size: 12px; color: #555; }
+  #controls { text-align: center; margin-top: 20px; }
+  button { margin: 5px; padding: 8px 12px; border-radius: 6px; border: none; background: #007acc; color: white; cursor: pointer; }
+  button:hover { background: #005ea3; }
+  #statsDashboard { max-width: 1000px; margin: 20px auto; display: none; }
+  #statsDashboard table { width: 100%; }
+  #statsDashboard th, #statsDashboard td { font-size: 12px; padding: 4px; }
+</style>
+</head>
+<body>
+<h1>Yahtzee Scorekeeper</h1>
+
+<div id="controls">
+  <input type="text" id="playerName" placeholder="Player name">
+  <button onclick="addPlayer()">Add Player</button>
+  <button onclick="endGame(true)">End Game & Save</button>
+  <button onclick="endGame(false)">End Without Saving</button>
+  <button onclick="showStats()">Show Stats</button>
+  <button onclick="hideStats()">Hide Stats</button>
+  <button onclick="clearGameData()">Clear All Game Data</button>
+</div>
+
+<table id="scoreTable">
+  <thead><tr><th>Category</th></tr></thead>
+  <tbody id="scoreBody"></tbody>
+</table>
+
+<div id="statsDashboard">
+  <h2>Player Stats</h2>
+  <table id="statsTable">
+    <thead><tr id="statsHeader"></tr></thead>
+    <tbody id="statsBody"></tbody>
+  </table>
+</div>
+
+<!-- Firebase SDK -->
+<script src="https://www.gstatic.com/firebasejs/10.1.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.1.0/firebase-firestore-compat.js"></script>
+
+<script>
+  // --- Firebase config ---
+  const firebaseConfig = {
+    apiKey: "AIzaSyBkvd10rqLKr40khhZP5X95ZsrWyRjlXRA",
+    authDomain: "yahtzee-scoring-tvs.firebaseapp.com",
+    projectId: "yahtzee-scoring-tvs",
+    storageBucket: "yahtzee-scoring-tvs.firebasestorage.app",
+    messagingSenderId: "651930856297",
+    appId: "1:651930856297:web:cce851e3b66949fb552bf8"
+  };
+  firebase.initializeApp(firebaseConfig);
+  const db = firebase.firestore();
+  db.enablePersistence().catch(err => console.log("Firestore persistence error:", err));
+
+  // --- Yahtzee logic ---
+  const categories = [
+    "Aces","Twos","Threes","Fours","Fives","Sixes","Upper Total","Bonus",
+    "3 of a Kind","4 of a Kind","Full House","Small Straight","Large Straight",
+    "Yahtzee","Yahtzee Bonus","Chance","Lower Total","Grand Total"
+  ];
+
+  const fixedValueCategories = {
+    "Full House":[0,25],"Small Straight":[0,30],"Large Straight":[0,40],"Yahtzee":[0,50]
+  };
+
+  let players = [];
+  let gameHistory = [];
+
+  // Load local data first
+  if(localStorage.getItem("yahtzeeGameHistory")){
+    gameHistory = JSON.parse(localStorage.getItem("yahtzeeGameHistory"));
+  }
+
+  // Sync from Firestore
+  db.collection("yahtzeeGames").onSnapshot(snapshot=>{
+    gameHistory = snapshot.docs.map(doc => doc.data());
+    localStorage.setItem("yahtzeeGameHistory", JSON.stringify(gameHistory));
+    updateStatsDashboard();
+  });
+
+  function saveHistory() {
+    localStorage.setItem("yahtzeeGameHistory", JSON.stringify(gameHistory));
+  }
+
+  function buildTable() {
+    const head = document.querySelector("#scoreTable thead tr");
+    head.innerHTML = "<th>Category</th>";
+    players.forEach((p,i)=> head.innerHTML += `<th>${p.name}</th>`);
+    const body = document.getElementById("scoreBody");
+    body.innerHTML = "";
+    categories.forEach(cat=>{
+      const row = document.createElement("tr");
+      row.innerHTML = `<td>${cat}</td>`;
+      players.forEach((p,i)=>{
+        if(["Upper Total","Bonus","Lower Total","Grand Total"].includes(cat)){
+          row.innerHTML += `<td id="calc-${cat}-${i}">0</td>`;
+        } else if(fixedValueCategories[cat]) {
+          let options = fixedValueCategories[cat].map(v=>`<option value="${v}">${v}</option>`).join("");
+          row.innerHTML += `<td><select data-player="${i}" data-cat="${cat}" onchange="updateScores(${i})">${options}</select></td>`;
+        } else if(cat==="Yahtzee Bonus") {
+          row.innerHTML += `<td><div class="yahtzee-bonus-box">
+            <div><input type="number" min="0" value="0" data-player="${i}" data-cat="Yahtzee Bonus Count" oninput="updateScores(${i})">
+            <div class="yahtzee-bonus-label"># Bonuses</div></div>
+            <div><span id="yahtzeeBonusScore-${i}">0</span><div class="yahtzee-bonus-label">Points</div></div>
+          </div></td>`;
+        } else {
+          row.innerHTML += `<td><input type="number" min="0" data-player="${i}" data-cat="${cat}" oninput="updateScores(${i})"></td>`;
+        }
+      });
+      body.appendChild(row);
+    });
+  }
+
+  function addPlayer() {
+    const name = document.getElementById("playerName").value.trim();
+    if(!name) return;
+    players.push({name,scores:{}});
+    document.getElementById("playerName").value = "";
+    buildTable();
+  }
+
+  function updateScores(playerIndex) {
+    const inputs = document.querySelectorAll(`[data-player="${playerIndex}"]`);
+    const scores = {};
+    inputs.forEach(inp=>{
+      if(inp.dataset.cat==="Yahtzee Bonus Count"){
+        const count = parseInt(inp.value)||0;
+        scores["Yahtzee Bonus"] = count*100;
+        document.getElementById(`yahtzeeBonusScore-${playerIndex}`).innerText = scores["Yahtzee Bonus"];
+      } else {
+        scores[inp.dataset.cat] = parseInt(inp.value)||0;
+      }
+    });
+    players[playerIndex].scores = scores;
+
+    // Upper total
+    let upper = ["Aces","Twos","Threes","Fours","Fives","Sixes"].reduce((sum,c)=>sum+(scores[c]||0),0);
+    document.getElementById(`calc-Upper Total-${playerIndex}`).innerText = upper;
+
+    // Bonus
+    const bonus = upper>=63?35:0;
+    document.getElementById(`calc-Bonus-${playerIndex}`).innerText = bonus;
+
+    // Lower total
+    const lower = ["3 of a Kind","4 of a Kind","Full House","Small Straight","Large Straight","Yahtzee","Yahtzee Bonus","Chance"]
+      .reduce((sum,c)=>sum+(scores[c]||0),0);
+    document.getElementById(`calc-Lower Total-${playerIndex}`).innerText = lower;
+
+    // Grand total
+    document.getElementById(`calc-Grand Total-${playerIndex}`).innerText = upper+bonus+lower;
+  }
+
+  function endGame(save){
+    if(save){
+      const result = players.map((p,i)=>({
+        name:p.name,
+        scores:p.scores,
+        bonus:parseInt(document.getElementById(`calc-Bonus-${i}`).innerText)||0,
+        grandTotal:parseInt(document.getElementById(`calc-Grand Total-${i}`).innerText)||0
+      }));
+      gameHistory.push({date:new Date(),result});
+      saveHistory();
+      db.collection("yahtzeeGames").add({date:new Date(),result})
+        .then(()=>console.log("Game synced to cloud"))
+        .catch(err=>console.log("Firestore error:",err));
+      alert("Game saved!");
+    } else alert("Game ended without saving.");
+    players=[]; buildTable(); updateStatsDashboard();
+  }
+
+  function clearGameData(){
+    if(confirm("Are you sure you want to wipe all game history?")){
+      gameHistory=[]; localStorage.removeItem("yahtzeeGameHistory");
+      // Clear Firestore
+      db.collection("yahtzeeGames").get().then(snapshot=>{
+        snapshot.docs.forEach(doc => doc.ref.delete());
+      });
+      updateStatsDashboard(); alert("All game data cleared.");
+    }
+  }
+
+  // --- Stats calculation ---
+  function calculateStats(){
+    const stats = {};
+    gameHistory.forEach(game=>{
+      const winnersScore = Math.max(...game.result.map(p=>p.grandTotal));
+      game.result.forEach(p=>{
+        if(!stats[p.name]) stats[p.name] = {games:0,wins:0,streak:0,maxStreak:0,totalPoints:0,totalGrand:0,highestScore:0,highestNoYahtzee:0,mostYahtzees:0,bonusCount:0,gamesWithYahtzee:0,scratchCounts:{}};
+        const s = stats[p.name]; s.games++;
+        if(p.grandTotal===winnersScore){ s.wins++; s.streak++; if(s.streak>s.maxStreak)s.maxStreak=s.streak;} else s.streak=0;
+        s.totalPoints += Object.values(p.scores).reduce((a,b)=>a+b,0)+(p.bonus||0);
+        s.totalGrand += p.grandTotal;
+        if(p.grandTotal>s.highestScore)s.highestScore=p.grandTotal;
+        if((p.scores.Yahtzee||0)===0){
+          const noYahtzee = Object.entries(p.scores).filter(([cat])=>cat!=="Yahtzee"&&cat!=="Yahtzee Bonus").reduce((sum,[k,v])=>sum+v,0)+(p.bonus||0);
+          if(noYahtzee>s.highestNoYahtzee)s.highestNoYahtzee=noYahtzee;
+        }
+        if((p.scores.Yahtzee||0)>0)s.gamesWithYahtzee++;
+        const yahtzeesThisGame = Math.floor((p.scores.Yahtzee||0)/50)+Math.floor((p.scores["Yahtzee Bonus"]||0)/100);
+        s.mostYahtzees = Math.max(s.mostYahtzees,yahtzeesThisGame);
+        if(p.bonus&&p.bonus>0)s.bonusCount++;
+        categories.forEach(cat=>{ if(["Upper Total","Bonus","Lower Total","Grand Total","Yahtzee Bonus"].includes(cat))return; if(!s.scratchCounts[cat])s.scratchCounts[cat]=0; if(!p.scores[cat]||p.scores[cat]===0)s.scratchCounts[cat]++; });
+      });
+    });
+    return stats;
+  }
+
+  function updateStatsDashboard(){
+    const statsDiv=document.getElementById("statsDashboard");
+    const statsBody=document.getElementById("statsBody");
+    const statsHeader=document.getElementById("statsHeader");
+    const stats=calculateStats();
+    statsHeader.innerHTML=`<th>Player</th><th>Games</th><th>Wins</th><th>Win %</th>
+      <th>Longest Streak</th><th>Total Points</th><th>Avg Grand Total</th>
+      <th>Highest Score</th><th>Highest w/o Yahtzee</th><th>Most Yahtzees in Game</th>
+      <th>Times Got Bonus</th><th>% Bonus</th><th>% Games w/ Yahtzee</th><th>Top Scratch</th><th>2nd Scratch</th>`;
+    statsBody.innerHTML="";
+    for(const player in stats){
+      const s=stats[player]; const scratchCats=Object.entries(s.scratchCounts).sort((a,b)=>b[1]-a[1]);
+      statsBody.innerHTML+=`<tr>
+        <td>${player}</td><td>${s.games}</td><td>${s.wins}</td><td>${((s.wins/s.games)*100).toFixed(1)}%</td>
+        <td>${s.maxStreak}</td><td>${s.totalPoints}</td><td>${(s.totalGrand/s.games).toFixed(1)}</td>
+        <td>${s.highestScore}</td><td>${s.highestNoYahtzee}</td><td>${s.mostYahtzees}</td>
+        <td>${s.bonusCount}</td><td>${((s.bonusCount/s.games)*100).toFixed(1)}%</td>
+        <td>${((s.gamesWithYahtzee/s.games)*100).toFixed(1)}%</td>
+        <td>${scratchCats[0]?scratchCats[0][0]:"-"}</td><td>${scratchCats[1]?scratchCats[1][0]:"-"}</td>
+      </tr>`;
+    }
+  }
+
+  function showStats(){ updateStatsDashboard(); document.getElementById("statsDashboard").style.display="block"; }
+  function hideStats(){ document.getElementById("statsDashboard").style.display="none"; }
+
+  buildTable();
+</script>
+</body>
+</html>
